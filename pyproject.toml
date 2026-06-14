@@ -1,0 +1,5 @@
+[tool.uv.workspace]
+members = [
+    "scripts",
+    "qwen-inference",
+]
