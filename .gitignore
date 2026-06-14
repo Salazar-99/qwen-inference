@@ -3,3 +3,4 @@ qwen-weights/
 __pycache__/
 *.py[cod]
 .python-version
+profiles/
