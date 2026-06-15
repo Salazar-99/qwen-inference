@@ -53,8 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ignore",
         nargs="*",
-        default=["lm_head"],
-        help="Module names/regexes to leave in full precision.",
+        default=["lm_head", "re:.*visual.*", "re:.*mtp.*"],
+        help=(
+            "Module names/regexes to leave in full precision. Defaults skip the "
+            "lm_head, the vision tower (model.visual.*), and the MTP head "
+            "(mtp.*): the vision/MTP layers receive no activations from text-only "
+            "calibration, so quantizing them would be meaningless or fail."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Calibration sampling seed.")
     return parser.parse_args()
@@ -99,17 +104,27 @@ def main() -> None:
             "Run scripts/download_weights.py first or pass --model-dir."
         )
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+        AutoTokenizer,
+    )
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import GPTQModifier
 
     print(f"Loading model from {model_dir} ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_dir),
-        dtype="auto",
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    load_kwargs = dict(dtype="auto", device_map="auto", trust_remote_code=True)
+    # Qwen3.5 is a multimodal Qwen3_5ForConditionalGeneration (text tower +
+    # vision tower + MTP head). It MUST be loaded as the full model so the saved
+    # checkpoint keeps the multimodal config and `model.language_model.*` /
+    # `model.visual.*` / `mtp.*` weight names that vLLM expects. Loading it as a
+    # plain CausalLM flattens the config and drops the vision/MTP weights, which
+    # vLLM then refuses to serve.
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(str(model_dir), **load_kwargs)
+    except (ValueError, KeyError, OSError) as exc:
+        print(f"  AutoModelForImageTextToText failed ({exc}); falling back to CausalLM.")
+        model = AutoModelForCausalLM.from_pretrained(str(model_dir), **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
 
     print(f"Building {args.num_samples} calibration samples from {args.dataset} ...")
@@ -137,6 +152,25 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(output_dir), save_compressed=True)
     tokenizer.save_pretrained(str(output_dir))
+
+    # Qwen3.5 is multimodal, so vLLM builds an image/video processor at load time
+    # and needs the processor configs that save_pretrained does not emit. Copy any
+    # non-weight aux files from the source dir that are missing in the output.
+    import shutil
+
+    aux_files = [
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+        "processor_config.json",
+        "merges.txt",
+        "vocab.json",
+    ]
+    for name in aux_files:
+        src = model_dir / name
+        dst = output_dir / name
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+            print(f"  copied aux file: {name}")
     print("Done. Serve with vLLM by pointing the model path at:")
     print(f"  {output_dir}")
 
