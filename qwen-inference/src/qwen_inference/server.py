@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 import os
 from pathlib import Path
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -26,6 +26,10 @@ DEFAULT_MODEL = os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-4B")
 
 _backend: "InferenceBackend | None" = None
 _model_ready = False
+# Backends that must be built inside the event loop (the async vLLM engine)
+# register a coroutine factory here; the FastAPI lifespan runs it on startup,
+# before the server reports ready.
+_pending_async_init: "Callable[[], Awaitable[None]] | None" = None
 
 
 class CompletionRequest(BaseModel):
@@ -84,9 +88,15 @@ def configure_baseline(
     _set_backend(BaselineTransformersBackend(model, tokenizer, device=device))
 
 
-def configure_vllm(model_dir: str) -> None:
-    """Use vLLM for competition-style baseline serving."""
-    _set_backend(VllmBackend(model_dir))
+async def configure_vllm(model_dir: str) -> None:
+    """Use vLLM (async engine) for competition-style serving."""
+    _set_backend(await VllmBackend.create(model_dir))
+
+
+def register_async_initializer(factory: "Callable[[], Awaitable[None]]") -> None:
+    """Defer backend construction to the event loop (run by the lifespan)."""
+    global _pending_async_init
+    _pending_async_init = factory
 
 
 def _set_backend(backend: InferenceBackend) -> None:
@@ -95,7 +105,7 @@ def _set_backend(backend: InferenceBackend) -> None:
     _model_ready = True
 
 
-def generate_from_prompt(
+async def generate_from_prompt(
     prompt: str,
     *,
     max_tokens: int,
@@ -104,14 +114,14 @@ def generate_from_prompt(
     """Generate raw text completion (no chat template, no thinking)."""
     _ensure_model_ready()
     assert _backend is not None
-    return _backend.generate_from_prompt(
+    return await _backend.generate_from_prompt(
         prompt,
         max_tokens=max_tokens,
         temperature=temperature,
     )
 
 
-def generate_from_messages(
+async def generate_from_messages(
     messages: list[ChatMessage],
     *,
     max_tokens: int,
@@ -122,7 +132,7 @@ def generate_from_messages(
     """Generate assistant text from chat messages."""
     _ensure_model_ready()
     assert _backend is not None
-    return _backend.generate_from_messages(
+    return await _backend.generate_from_messages(
         messages,
         max_tokens=max_tokens,
         temperature=temperature,
@@ -131,13 +141,13 @@ def generate_from_messages(
     )
 
 
-def profile_forward_passes(prompt: str, *, decode_steps: int) -> dict[str, Any]:
+async def profile_forward_passes(prompt: str, *, decode_steps: int) -> dict[str, Any]:
     _ensure_model_ready()
     assert _backend is not None
-    return _backend.profile_forward_passes(prompt, decode_steps=decode_steps)
+    return await _backend.profile_forward_passes(prompt, decode_steps=decode_steps)
 
 
-def profile_forward_passes_with_options(
+async def profile_forward_passes_with_options(
     prompt: str,
     *,
     decode_steps: int,
@@ -146,7 +156,7 @@ def profile_forward_passes_with_options(
 ) -> dict[str, Any]:
     _ensure_model_ready()
     assert _backend is not None
-    return _backend.profile_forward_passes(
+    return await _backend.profile_forward_passes(
         prompt,
         decode_steps=decode_steps,
         profile=profile,
@@ -233,7 +243,18 @@ def _profile_capture(enabled: bool, trace_path: str | None = None) -> Iterator[N
         yield
 
 
-app = FastAPI(title="Qwen Inference Server")
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Build any deferred backend (the async vLLM engine) inside the running loop,
+    # including warmup, before the server starts accepting requests.
+    global _pending_async_init
+    if _pending_async_init is not None:
+        await _pending_async_init()
+        _pending_async_init = None
+    yield
+
+
+app = FastAPI(title="Qwen Inference Server", lifespan=_lifespan)
 
 
 @app.get("/ping")
@@ -243,14 +264,14 @@ def ping() -> dict[str, str]:
 
 
 @app.post("/invocations")
-def invocations(request: InvocationRequest) -> dict[str, Any]:
+async def invocations(request: InvocationRequest) -> dict[str, Any]:
     _ensure_model_ready()
 
     if request.messages is not None:
         if request.stream:
             raise HTTPException(status_code=501, detail="Streaming is not implemented yet")
         with _nsys_capture(request.profile):
-            text = generate_from_messages(
+            text = await generate_from_messages(
                 request.messages,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
@@ -261,7 +282,7 @@ def invocations(request: InvocationRequest) -> dict[str, Any]:
 
     if request.prompt is not None:
         with _nsys_capture(request.profile):
-            text = generate_from_prompt(
+            text = await generate_from_prompt(
                 request.prompt,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
@@ -275,12 +296,12 @@ def invocations(request: InvocationRequest) -> dict[str, Any]:
 
 
 @app.post("/profile/forward")
-def profile_forward(request: ForwardProfileRequest) -> dict[str, Any]:
+async def profile_forward(request: ForwardProfileRequest) -> dict[str, Any]:
     _ensure_model_ready()
     assert _backend is not None
 
     if isinstance(_backend, VllmBackend):
-        return profile_forward_passes_with_options(
+        return await profile_forward_passes_with_options(
             request.prompt,
             decode_steps=request.decode_steps,
             profile=request.profile,
@@ -288,16 +309,16 @@ def profile_forward(request: ForwardProfileRequest) -> dict[str, Any]:
         )
 
     with _profile_capture(request.profile, request.trace_path):
-        return profile_forward_passes(
+        return await profile_forward_passes(
             request.prompt,
             decode_steps=request.decode_steps,
         )
 
 
 @app.post("/v1/completions")
-def v1_completions(request: CompletionRequest) -> dict[str, Any]:
+async def v1_completions(request: CompletionRequest) -> dict[str, Any]:
     _ensure_model_ready()
-    text = generate_from_prompt(
+    text = await generate_from_prompt(
         request.prompt,
         max_tokens=request.max_tokens,
         temperature=request.temperature,
@@ -306,13 +327,13 @@ def v1_completions(request: CompletionRequest) -> dict[str, Any]:
 
 
 @app.post("/v1/chat/completions")
-def v1_chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
+async def v1_chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
     _ensure_model_ready()
 
     if request.stream:
         raise HTTPException(status_code=501, detail="Streaming is not implemented yet")
 
-    text = generate_from_messages(
+    text = await generate_from_messages(
         request.messages,
         max_tokens=request.max_tokens,
         temperature=request.temperature,

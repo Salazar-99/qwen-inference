@@ -12,7 +12,13 @@ import uvicorn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from qwen_inference.backends.custom.loader import DEFAULT_MODEL_DIR, load_weights
-from qwen_inference.server import app, configure_baseline, configure_custom, configure_vllm
+from qwen_inference.server import (
+    app,
+    configure_baseline,
+    configure_custom,
+    configure_vllm,
+    register_async_initializer,
+)
 from qwen_inference.tokenizer import Tokenizer
 
 DEFAULT_HOST = os.environ.get("HOST", "0.0.0.0")
@@ -60,7 +66,9 @@ def _load_vllm_backend(model_dir: Path) -> None:
             "then rerun with --mode vllm."
         ) from exc
 
-    configure_vllm(str(model_dir))
+    # The async vLLM engine must be built inside the event loop; defer it to the
+    # server's startup lifespan instead of constructing it here.
+    register_async_initializer(lambda: configure_vllm(str(model_dir)))
 
 
 def main() -> None:

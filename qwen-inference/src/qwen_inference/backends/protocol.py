@@ -8,7 +8,7 @@ from qwen_inference.types import ChatMessage
 
 
 class InferenceBackend(Protocol):
-    def generate_from_prompt(
+    async def generate_from_prompt(
         self,
         prompt: str,
         *,
@@ -16,7 +16,7 @@ class InferenceBackend(Protocol):
         temperature: float,
     ) -> str: ...
 
-    def generate_from_messages(
+    async def generate_from_messages(
         self,
         messages: list[ChatMessage],
         *,
@@ -26,7 +26,7 @@ class InferenceBackend(Protocol):
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> str: ...
 
-    def profile_forward_passes(
+    async def profile_forward_passes(
         self,
         prompt: str,
         *,

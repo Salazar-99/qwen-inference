@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
+import inspect
+import logging
 import os
 from pathlib import Path
 import shutil
 import time
+import uuid
 from collections.abc import Iterator
 from typing import Any
 
@@ -15,20 +19,84 @@ from fastapi import HTTPException
 
 from qwen_inference.types import ChatMessage
 
+logger = logging.getLogger(__name__)
 
-def _build_profiler_config(profile_dir: str) -> Any:
-    config_kwargs = {
-        "profiler": "torch",
-        "torch_profiler_dir": profile_dir,
-        "delay_iterations": 0,
-        "max_iterations": 0,
-    }
+
+async def _maybe_await(value: Any) -> Any:
+    """Await ``value`` if it is awaitable, else return it as-is.
+
+    vLLM's async engine methods (``get_tokenizer``, ``start_profile`` …) are
+    coroutines on the V1 engine but plain calls on some builds; this keeps the
+    call sites agnostic.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+# Generic geometric sweep of prompt lengths (in tokens) to warm before serving.
+# Spans the serving range so the per-shape Triton autotune + JIT compile and
+# CUDA-graph capture for the gated-delta-net (fla) attention path happen at
+# startup rather than on the first request. This covers both the latency
+# benchmark sizes (64/2048/8192) and the quality-eval prompt lengths in between,
+# without being tied to any specific benchmark's exact values.
+WARMUP_PROMPT_TOKENS = (64, 256, 1024, 4096, 8192)
+
+# Same filler string the benchmark uses (~10 tokens per repetition), so the
+# prompts we build tokenize to the same lengths the benchmark drives.
+_WARMUP_FILLER = "The quick brown fox jumps over the lazy dog. "
+
+
+def _warmup_prompt_token_counts() -> list[int]:
+    raw = os.environ.get("VLLM_WARMUP_PROMPT_TOKENS")
+    if not raw:
+        return list(WARMUP_PROMPT_TOKENS)
+    counts = [int(part) for part in raw.split(",") if part.strip()]
+    return counts or list(WARMUP_PROMPT_TOKENS)
+
+
+def _build_async_engine(model_dir: str) -> Any:
+    """Construct the vLLM async engine (continuous batching across requests).
+
+    This deployment runs the V1 engine (see ``vllm/v1/...`` in the profiler
+    traces), whose async front-end is ``AsyncLLM``. We fall back to the legacy
+    ``AsyncLLMEngine`` shim for older builds. Must be called from within a
+    running event loop so the engine can start its background output handler.
+    """
     try:
-        from vllm.config import ProfilerConfig
+        from vllm import AsyncEngineArgs
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "vLLM is not installed. Install dependencies with "
+                "'UV_TORCH_BACKEND=auto uv sync --package qwen-inference --group dev --group vllm'."
+            ),
+        ) from exc
 
-        return ProfilerConfig(**config_kwargs)
+    max_num_seqs = max(1, int(os.environ.get("VLLM_MAX_NUM_SEQS", "16")))
+    engine_args = AsyncEngineArgs(
+        model=model_dir,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        max_num_seqs=max_num_seqs,
+    )
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM
+
+        return AsyncLLM.from_engine_args(engine_args)
     except ImportError:
-        return config_kwargs
+        from vllm import AsyncLLMEngine
+
+        return AsyncLLMEngine.from_engine_args(engine_args)
 
 
 def _count_prompt_tokens(tokenizer: Any, prompt: str) -> int:
@@ -94,9 +162,24 @@ def _nsys_capture(enabled: bool) -> Iterator[None]:
 
 
 class VllmBackend:
-    def __init__(self, model_dir: str) -> None:
+    """Async vLLM backend.
+
+    Built with :meth:`create` from inside the server's event loop so the single
+    shared ``AsyncLLM`` engine drives continuous batching: concurrent requests
+    are concurrent coroutines on one loop, co-scheduled into the same decode
+    batch instead of serializing.
+    """
+
+    def __init__(self, engine: Any, tokenizer: Any, sampling_params_cls: Any, profiler_dir: Path) -> None:
+        self._engine = engine
+        self.tokenizer = tokenizer
+        self._sampling_params_cls = sampling_params_cls
+        self._profiler_dir = profiler_dir
+
+    @classmethod
+    async def create(cls, model_dir: str) -> "VllmBackend":
         try:
-            from vllm import LLM, SamplingParams
+            from vllm import SamplingParams
         except ImportError as exc:
             raise HTTPException(
                 status_code=503,
@@ -106,18 +189,71 @@ class VllmBackend:
                 ),
             ) from exc
 
-        self._sampling_params_cls = SamplingParams
-        self._profiler_dir = Path(
-            os.environ.get("VLLM_PROFILER_DIR", "/tmp/vllm-profiler"),
+        profiler_dir = Path(os.environ.get("VLLM_PROFILER_DIR", "/tmp/vllm-profiler"))
+        profiler_dir.mkdir(parents=True, exist_ok=True)
+        # The async/server torch profiler is enabled via env var; it must be set
+        # before the engine is constructed for start_profile()/stop_profile().
+        os.environ.setdefault("VLLM_TORCH_PROFILER_DIR", str(profiler_dir))
+
+        engine = _build_async_engine(model_dir)
+        tokenizer = await _maybe_await(engine.get_tokenizer())
+        backend = cls(engine, tokenizer, SamplingParams, profiler_dir)
+
+        if _env_flag("VLLM_WARMUP", default=True):
+            await backend._warmup()
+        return backend
+
+    async def _agenerate(self, prompt: str, params: Any) -> str:
+        """Drive one request through the async engine to completion."""
+        request_id = f"qwen-{uuid.uuid4().hex}"
+        final = None
+        async for output in self._engine.generate(prompt, params, request_id):
+            final = output
+        if final is None or not final.outputs:
+            return ""
+        return final.outputs[0].text
+
+    async def _warmup(self) -> None:
+        """Run representative generations so kernels are compiled before serving.
+
+        The first real forward pass otherwise pays a large one-time cost:
+        Triton JIT compilation + autotuning of the gated-delta-net (fla) linear
+        attention kernels, torch._dynamo AOT compilation, and CUDA-graph capture.
+        These costs are per prefill shape, so we warm a geometric sweep of prompt
+        lengths across the serving range (see WARMUP_PROMPT_TOKENS) and force a few
+        decode steps so the decode-path kernels compile too. Running them
+        concurrently also exercises the batched decode path. The idle time lands
+        here at startup (before the server is ready) instead of on the first
+        request.
+        """
+        decode_steps = max(1, int(os.environ.get("VLLM_WARMUP_DECODE_STEPS", "8")))
+        token_counts = _warmup_prompt_token_counts()
+        # Mirror the benchmark's prompt construction (~10 tokens per filler repeat)
+        # so each prompt tokenizes to its target length.
+        prompts = [
+            _WARMUP_FILLER * max(1, num_tokens // 10) for num_tokens in token_counts
+        ]
+        params = self._sampling_params_cls(
+            temperature=0.0,
+            max_tokens=decode_steps,
+            min_tokens=decode_steps,
+            ignore_eos=True,
         )
-        self._profiler_dir.mkdir(parents=True, exist_ok=True)
-        self.llm = LLM(
-            model=model_dir,
-            dtype="bfloat16",
-            trust_remote_code=True,
-            profiler_config=_build_profiler_config(str(self._profiler_dir)),
+
+        start = time.perf_counter()
+        try:
+            await asyncio.gather(*(self._agenerate(p, params) for p in prompts))
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001 - warmup must never block serving
+            logger.exception("vLLM warmup failed; first request may be slow")
+            return
+        logger.info(
+            "vLLM warmup complete in %.2fs (prompt tokens=%s, %d decode steps each)",
+            time.perf_counter() - start,
+            token_counts,
+            decode_steps,
         )
-        self.tokenizer = self.llm.get_tokenizer()
 
     def _sampling_params(self, *, max_tokens: int, temperature: float) -> Any:
         kwargs: dict[str, Any] = {"max_tokens": max_tokens}
@@ -143,33 +279,17 @@ class VllmBackend:
             ignore_eos=True,
         )
 
-    def _generate_text(self, prompt: str, *, max_tokens: int, temperature: float) -> str:
-        outputs = self.llm.generate(
-            [prompt],
-            self._sampling_params(max_tokens=max_tokens, temperature=temperature),
-        )
-        return outputs[0].outputs[0].text
-
-    def _run_profiled_generate(self, prompt: str, *, decode_steps: int) -> None:
-        self.llm.generate(
-            [prompt],
-            self._profile_sampling_params(decode_steps=decode_steps),
-        )
-
-    def generate_from_prompt(
+    async def generate_from_prompt(
         self,
         prompt: str,
         *,
         max_tokens: int,
         temperature: float,
     ) -> str:
-        return self._generate_text(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        params = self._sampling_params(max_tokens=max_tokens, temperature=temperature)
+        return await self._agenerate(prompt, params)
 
-    def generate_from_messages(
+    async def generate_from_messages(
         self,
         messages: list[ChatMessage],
         *,
@@ -188,13 +308,10 @@ class VllmBackend:
             tokenize=False,
             **template_kwargs,
         )
-        return self._generate_text(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        params = self._sampling_params(max_tokens=max_tokens, temperature=temperature)
+        return await self._agenerate(prompt, params)
 
-    def profile_forward_passes(
+    async def profile_forward_passes(
         self,
         prompt: str,
         *,
@@ -204,22 +321,22 @@ class VllmBackend:
     ) -> dict[str, Any]:
         decode_steps = max(0, decode_steps)
         prompt_tokens = _count_prompt_tokens(self.tokenizer, prompt)
+        params = self._profile_sampling_params(decode_steps=decode_steps)
 
         if trace_path:
             trace_output = Path(trace_path)
-            profile_prefix = trace_output.stem
-            self.llm.start_profile(profile_prefix=profile_prefix)
+            await _maybe_await(self._engine.start_profile())
             try:
-                self._run_profiled_generate(prompt, decode_steps=decode_steps)
+                await self._agenerate(prompt, params)
             finally:
-                self.llm.stop_profile()
-                time.sleep(1)
+                await _maybe_await(self._engine.stop_profile())
+                await asyncio.sleep(1)
             _export_latest_trace(self._profiler_dir, trace_output)
         elif profile:
             with _nsys_capture(True):
-                self._run_profiled_generate(prompt, decode_steps=decode_steps)
+                await self._agenerate(prompt, params)
         else:
-            self._run_profiled_generate(prompt, decode_steps=decode_steps)
+            await self._agenerate(prompt, params)
 
         return {
             "prompt_tokens": prompt_tokens,

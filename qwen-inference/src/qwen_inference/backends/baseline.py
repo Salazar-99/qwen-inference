@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import torch
@@ -22,7 +23,7 @@ class BaselineTransformersBackend:
         self.tokenizer = tokenizer
         self.device = torch.device(device)
 
-    def generate_from_prompt(
+    async def generate_from_prompt(
         self,
         prompt: str,
         *,
@@ -30,9 +31,12 @@ class BaselineTransformersBackend:
         temperature: float,
     ) -> str:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        return self._generate(inputs, max_tokens=max_tokens, temperature=temperature)
+        # HF generate is blocking; run it off the event loop.
+        return await asyncio.to_thread(
+            self._generate, inputs, max_tokens=max_tokens, temperature=temperature
+        )
 
-    def generate_from_messages(
+    async def generate_from_messages(
         self,
         messages: list[ChatMessage],
         *,
@@ -52,7 +56,8 @@ class BaselineTransformersBackend:
             tokenize=True,
             **template_kwargs,
         ).to(self.device)
-        return self._generate(
+        return await asyncio.to_thread(
+            self._generate,
             {"input_ids": input_ids},
             max_tokens=max_tokens,
             temperature=temperature,
@@ -81,13 +86,23 @@ class BaselineTransformersBackend:
         new_tokens = output_ids[0, input_length:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-    def profile_forward_passes(
+    async def profile_forward_passes(
         self,
         prompt: str,
         *,
         decode_steps: int,
         profile: bool = False,
         trace_path: str | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._profile_forward_passes, prompt, decode_steps=decode_steps
+        )
+
+    def _profile_forward_passes(
+        self,
+        prompt: str,
+        *,
+        decode_steps: int,
     ) -> dict[str, Any]:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         input_length = inputs["input_ids"].shape[-1]

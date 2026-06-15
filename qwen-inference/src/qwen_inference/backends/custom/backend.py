@@ -14,7 +14,7 @@ class CustomBackend:
         self.weights = weights
         self.tokenizer = tokenizer
 
-    def generate_from_prompt(
+    async def generate_from_prompt(
         self,
         prompt: str,
         *,
@@ -26,7 +26,7 @@ class CustomBackend:
             detail="Custom prompt completion is not implemented yet",
         )
 
-    def generate_from_messages(
+    async def generate_from_messages(
         self,
         messages: list[ChatMessage],
         *,
@@ -40,7 +40,7 @@ class CustomBackend:
             detail="Custom chat completion is not implemented yet",
         )
 
-    def profile_forward_passes(
+    async def profile_forward_passes(
         self,
         prompt: str,
         *,
