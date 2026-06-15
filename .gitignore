@@ -1,5 +1,7 @@
 .venv/
+.venv-quantize/
 qwen-weights/
+qwen-weights-quantized/
 __pycache__/
 *.py[cod]
 .python-version

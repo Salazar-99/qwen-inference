@@ -226,4 +226,88 @@ If the importer cannot run, Nsight may produce only a raw `.qdstrm` file. `nsys 
 - First `vllm` server start can take several minutes while vLLM compiles; later runs are faster.
 - `profiles/` is gitignored.
 
+## Benchmarking
+
+[`scripts/benchmark.sh`](scripts/benchmark.sh) runs the competition eval harness
+([`evals/run_eval_local.py`](evals/run_eval_local.py)) against a chosen set of
+model weights. It starts the inference server, waits for `/ping`, runs the
+requested benchmark(s), then shuts the server down.
+
+```text
+./scripts/benchmark.sh [quality|latency|both] [MODEL_WEIGHTS_DIR]
+```
+
+| Argument | Values | Default |
+| --- | --- | --- |
+| Benchmark kind | `quality`, `latency`, `both` | `both` |
+| Model weights | path to a weights directory | `qwen-inference/qwen-weights` |
+
+The kind maps to the harness `EVAL_MODE` (`quality` → `quality`, `latency` →
+`latency`, `both` → `full`). The weights path is exported as `MODEL_DIR`, which
+is how `qwen-serve` selects weights for every backend.
+
+### Prerequisites
+
+- Workspace deps installed: `UV_TORCH_BACKEND=auto uv sync --package qwen-inference --group dev --group vllm`
+- The eval harness deps importable by `EVAL_PYTHON` (default `python3`):
+  `pip install lm-eval==0.4.11 langdetect immutabledict`
+  (`run_eval_local.py` imports `lm_eval` at module load, so this is required for
+  every kind, including `latency`.) Point at a different interpreter with
+  `EVAL_PYTHON=/path/to/python`.
+- For quality benchmarks, the MMLU-Pro / IFEval / GPQA-Diamond datasets must be
+  available in `HF_HOME` (the harness runs with `HF_HUB_OFFLINE=1`).
+
+### Examples
+
+```bash
+# Serve the INT4 (GPTQ) checkpoint and run both quality + latency
+./scripts/benchmark.sh both qwen-inference/qwen-weights-quantized
+
+# Quality gates only, on the full set (not the 10% dev sample)
+QUALITY_LIMIT=1.0 ./scripts/benchmark.sh quality qwen-inference/qwen-weights-quantized
+
+# Latency only against the bf16 baseline weights
+LATENCY_RUNS=50 ./scripts/benchmark.sh latency qwen-inference/qwen-weights
+```
+
+### Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `INFERENCE_MODE` / `MODE` | `vllm` | Serving backend (`baseline`, `custom`, `vllm`) |
+| `QUALITY_LIMIT` | `0.1` | Fraction of each quality task to run (`1.0` = full) |
+| `NUM_CONCURRENT` | `8` | Concurrent quality requests |
+| `LATENCY_RUNS` | `50` | Measured latency runs (passed as `NUM_RUNS`) |
+| `EVAL_PYTHON` | `python3` | Interpreter with the eval harness installed |
+| `HOST` / `PORT` | `127.0.0.1` / `8080` | Server bind / client URL |
+| `SERVER_WAIT_SECONDS` | `600` | Max wait for `/ping` |
+| `RESULTS_DIR` | `profiles/benchmarks` | Output root for result JSON |
+
+### Output layout
+
+```text
+profiles/
+├── benchmarks/  # <mode>-<weights>-<kind>-<timestamp>.json result summaries
+└── logs/        # server .log files
+```
+
+## Quantization
+
+[`scripts/quantize_gptq.py`](scripts/quantize_gptq.py) produces an INT4 (GPTQ
+W4A16) `compressed-tensors` checkpoint that vLLM serves via the Marlin kernel on
+Ampere (A10G). Run it in a dedicated environment (kept out of the uv workspace
+because the `llmcompressor` line that supports the git `transformers` build
+conflicts with the `vllm`-pinned `compressed-tensors`):
+
+```bash
+uv venv .venv-quantize --python 3.12
+UV_TORCH_BACKEND=auto uv pip install --python .venv-quantize -r scripts/quantize-requirements.txt
+.venv-quantize/bin/python scripts/quantize_gptq.py
+```
+
+By default it reads `qwen-inference/qwen-weights` and writes
+`qwen-inference/qwen-weights-quantized`. Validate the result with
+`./scripts/benchmark.sh both qwen-inference/qwen-weights-quantized` before
+submitting — especially the GPQA-Diamond quality gate.
+
 See [`competition-guide.md`](competition-guide.md) for full competition details.

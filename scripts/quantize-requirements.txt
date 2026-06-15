@@ -1,0 +1,21 @@
+# Isolated environment for GPTQ INT4 quantization (see scripts/quantize_gptq.py).
+#
+# Deliberately kept OUT of the uv workspace: the llmcompressor line that supports
+# transformers 5.x (required for Qwen3.5) depends on compressed-tensors>=0.17.2a2,
+# which conflicts with the compressed-tensors version pinned by vllm==0.19.1 in
+# the server env. This step does not need vllm.
+#
+#   uv venv .venv-quantize --python 3.12
+#   UV_TORCH_BACKEND=auto uv pip install --python .venv-quantize -r scripts/quantize-requirements.txt
+#   .venv-quantize/bin/python scripts/quantize_gptq.py
+
+torch>=2.10.0
+# torchvision is imported eagerly by the Qwen3-VL video processor during model
+# load even for text-only use; without it transformers raises ImportError.
+torchvision
+# git transformers (5.13.x dev) is required to load the Qwen3.5 hybrid arch.
+transformers @ git+https://github.com/huggingface/transformers.git
+# Released llmcompressor caps transformers<=4.57.6; main targets transformers>=5.9.0.
+llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git
+datasets>=4.8.4
+accelerate>=1.6.0
