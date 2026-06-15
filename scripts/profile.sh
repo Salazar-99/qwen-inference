@@ -11,20 +11,35 @@ PROFILE_KIND="${3:-${PROFILE_KIND:-latency}}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 PROFILE_DIR="${PROFILE_DIR:-profiles}"
-WARMUP_RUNS="${WARMUP_RUNS:-5}"
+LATENCY_DIR="${PROFILE_DIR}/latency"
+LOGS_DIR="${PROFILE_DIR}/logs"
+TRACES_DIR="${PROFILE_DIR}/traces"
+WARMUP_RUNS="${WARMUP_RUNS:-3}"
 LATENCY_RUNS="${LATENCY_RUNS:-50}"
 DECODE_STEPS="${DECODE_STEPS:-4}"
 FILLER="${FILLER:-The quick brown fox jumps over the lazy dog. }"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-OUTPUT_BASENAME="${PROFILE_DIR}/${MODE}-${PROMPT_SIZE}-${PROFILE_KIND}-${TIMESTAMP}"
-SERVER_LOG="${OUTPUT_BASENAME}.server.log"
+OUTPUT_STEM="${MODE}-${PROMPT_SIZE}-${PROFILE_KIND}-${TIMESTAMP}"
+SERVER_LOG="${LOGS_DIR}/${OUTPUT_STEM}.log"
 CONTAINER_URL="http://${HOST}:${PORT}"
 export CONTAINER_URL DECODE_STEPS FILLER LATENCY_RUNS PROMPT_SIZE WARMUP_RUNS
 
+if [[ "${MODE}" == "all" ]]; then
+  MODES=(baseline custom vllm)
+  for mode in "${MODES[@]}"; do
+    echo
+    echo "=== Profiling ${mode} (${PROFILE_KIND}, warmup=${WARMUP_RUNS}) ==="
+    WARMUP_RUNS="${WARMUP_RUNS}" LATENCY_RUNS="${LATENCY_RUNS}" DECODE_STEPS="${DECODE_STEPS}" \
+      PROFILE_DIR="${PROFILE_DIR}" HOST="${HOST}" PORT="${PORT}" FILLER="${FILLER}" \
+      "$0" "${mode}" "${PROMPT_SIZE}" "${PROFILE_KIND}"
+  done
+  exit 0
+fi
+
 case "${MODE}" in
-  baseline|custom) ;;
+  baseline|custom|vllm) ;;
   *)
-    echo "Usage: $0 [baseline|custom] [short|medium|long|all] [latency|cuda-forward]" >&2
+    echo "Usage: $0 [baseline|custom|vllm|all] [short|medium|long|all] [latency|cuda-forward|nsys-forward]" >&2
     exit 2
     ;;
 esac
@@ -32,20 +47,20 @@ esac
 case "${PROMPT_SIZE}" in
   short|medium|long|all) ;;
   *)
-    echo "Usage: $0 [baseline|custom] [short|medium|long|all] [latency|cuda-forward]" >&2
+    echo "Usage: $0 [baseline|custom|vllm|all] [short|medium|long|all] [latency|cuda-forward|nsys-forward]" >&2
     exit 2
     ;;
 esac
 
 case "${PROFILE_KIND}" in
-  latency|cuda-forward) ;;
+  latency|cuda-forward|nsys-forward) ;;
   *)
-    echo "Usage: $0 [baseline|custom] [short|medium|long|all] [latency|cuda-forward]" >&2
+    echo "Usage: $0 [baseline|custom|vllm|all] [short|medium|long|all] [latency|cuda-forward|nsys-forward]" >&2
     exit 2
     ;;
 esac
 
-if [[ "${PROFILE_KIND}" == "cuda-forward" && "${PROMPT_SIZE}" == "all" ]]; then
+if [[ "${PROFILE_KIND}" != "latency" && "${PROMPT_SIZE}" == "all" ]]; then
   echo "CUDA forward profiling captures one prompt size at a time; run short, medium, and long separately." >&2
   exit 2
 fi
@@ -128,7 +143,8 @@ make_payload() {
   local prompt_size="$1"
   local endpoint_kind="${2:-invocations}"
   local profile="${3:-false}"
-  python3 - "${prompt_size}" "${endpoint_kind}" "${profile}" <<'PY'
+  local trace_path="${4:-}"
+  python3 - "${prompt_size}" "${endpoint_kind}" "${profile}" "${trace_path}" <<'PY'
 import json
 import os
 import sys
@@ -147,6 +163,8 @@ if sys.argv[2] == "forward":
         "decode_steps": int(os.environ["DECODE_STEPS"]),
         "profile": sys.argv[3] == "true",
     }
+    if sys.argv[4]:
+        payload["trace_path"] = sys.argv[4]
 else:
     payload = {
         "prompt": prompt,
@@ -157,9 +175,11 @@ print(json.dumps(payload))
 PY
 }
 
+SERVER_WAIT_SECONDS="${SERVER_WAIT_SECONDS:-600}"
+
 wait_for_server() {
-  echo "Waiting for ${CONTAINER_URL}/ping ..."
-  for _ in $(seq 1 180); do
+  echo "Waiting for ${CONTAINER_URL}/ping (up to ${SERVER_WAIT_SECONDS}s)..."
+  for _ in $(seq 1 "${SERVER_WAIT_SECONDS}"); do
     if curl -fsS "${CONTAINER_URL}/ping" >/dev/null 2>&1; then
       return 0
     fi
@@ -185,7 +205,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${PROFILE_DIR}"
+mkdir -p "${LATENCY_DIR}" "${LOGS_DIR}" "${TRACES_DIR}"
 
 if [[ "${PROMPT_SIZE}" == "all" ]]; then
   PROMPT_SIZES=(short medium long)
@@ -194,9 +214,11 @@ else
 fi
 
 if [[ "${PROFILE_KIND}" == "latency" ]]; then
+  LATENCY_OUTPUT="${LATENCY_DIR}/${OUTPUT_STEM}.json"
   echo "Starting ${MODE} server for end-to-end latency profiling..."
   echo "Using latency-eval prompt size(s): ${PROMPT_SIZES[*]}"
-  echo "Writing latency results to ${OUTPUT_BASENAME}.latency.json"
+  echo "Warmup runs: ${WARMUP_RUNS}; measured runs: ${LATENCY_RUNS}"
+  echo "Writing latency results to ${LATENCY_OUTPUT}"
   echo "Writing server log to ${SERVER_LOG}"
 
   INFERENCE_MODE="${MODE}" HOST="${HOST}" PORT="${PORT}" \
@@ -205,7 +227,7 @@ if [[ "${PROFILE_KIND}" == "latency" ]]; then
   SERVER_PID="$!"
   wait_for_server
 
-  python3 - "${OUTPUT_BASENAME}.latency.json" "${PROMPT_SIZES[@]}" <<'PY'
+  python3 - "${LATENCY_OUTPUT}" "${PROMPT_SIZES[@]}" <<'PY'
 import json
 import os
 import statistics
@@ -223,6 +245,12 @@ prompt_configs = {
     "short": {"num_tokens": 64, "max_new_tokens": 128},
     "medium": {"num_tokens": 2048, "max_new_tokens": 256},
     "long": {"num_tokens": 8192, "max_new_tokens": 256},
+}
+competition_baseline_ms = {
+    "short": 2582,
+    "medium": 5441,
+    "long": 6576,
+    "average": 4866,
 }
 
 def make_payload(prompt_size: str) -> dict:
@@ -252,16 +280,50 @@ for prompt_size in prompt_sizes:
         invoke(payload)
 
     latencies = [invoke(payload) for _ in range(latency_runs)]
+    mean_ms = statistics.mean(latencies)
+    median_ms = statistics.median(latencies)
+    baseline_ms = competition_baseline_ms[prompt_size]
     results[prompt_size] = {
         "warmup_runs": warmup_runs,
         "runs": latency_runs,
-        "mean_ms": round(statistics.mean(latencies), 2),
-        "median_ms": round(statistics.median(latencies), 2),
+        "competition_baseline_ms": baseline_ms,
+        "mean_ms": round(mean_ms, 2),
+        "mean_delta_vs_competition_ms": round(mean_ms - baseline_ms, 2),
+        "mean_speedup_vs_competition": round(baseline_ms / mean_ms, 4),
+        "median_ms": round(median_ms, 2),
+        "median_delta_vs_competition_ms": round(median_ms - baseline_ms, 2),
+        "median_speedup_vs_competition": round(baseline_ms / median_ms, 4),
         "min_ms": round(min(latencies), 2),
         "max_ms": round(max(latencies), 2),
         "latencies_ms": [round(value, 2) for value in latencies],
     }
-    print(f"{prompt_size}: mean={results[prompt_size]['mean_ms']} ms, median={results[prompt_size]['median_ms']} ms")
+
+    median_delta = results[prompt_size]["median_delta_vs_competition_ms"]
+    median_speedup = results[prompt_size]["median_speedup_vs_competition"]
+    print(
+        f"{prompt_size}: mean={results[prompt_size]['mean_ms']} ms, "
+        f"median={results[prompt_size]['median_ms']} ms, "
+        f"baseline={baseline_ms} ms, "
+        f"delta={median_delta:+.2f} ms, "
+        f"speedup={median_speedup:.4f}x"
+    )
+
+if results:
+    average_median_ms = statistics.mean(
+        result["median_ms"] for result in results.values()
+    )
+    results["average"] = {
+        "competition_baseline_ms": competition_baseline_ms["average"],
+        "median_ms": round(average_median_ms, 2),
+        "median_delta_vs_competition_ms": round(
+            average_median_ms - competition_baseline_ms["average"],
+            2,
+        ),
+        "median_speedup_vs_competition": round(
+            competition_baseline_ms["average"] / average_median_ms,
+            4,
+        ),
+    }
 
 with open(output_path, "w") as output_file:
     json.dump(results, output_file, indent=2)
@@ -272,17 +334,62 @@ PY
 
   echo
   echo "Latency profile complete:"
-  echo "  ${OUTPUT_BASENAME}.latency.json"
+  echo "  ${LATENCY_OUTPUT}"
   echo "  ${SERVER_LOG}"
+  exit 0
+fi
+
+if [[ "${PROFILE_KIND}" == "cuda-forward" ]]; then
+  TRACE_OUTPUT="${TRACES_DIR}/${OUTPUT_STEM}.trace.json"
+  echo "Starting ${MODE} server for torch CUDA forward-pass profiling..."
+  echo "Using prompt size: ${PROMPT_SIZE}; decode forwards: ${DECODE_STEPS}"
+  echo "Warmup runs: ${WARMUP_RUNS}"
+  echo "Writing Chrome trace to ${TRACE_OUTPUT}"
+  echo "Writing server log to ${SERVER_LOG}"
+
+  INFERENCE_MODE="${MODE}" HOST="${HOST}" PORT="${PORT}" \
+    uv run --package qwen-inference qwen-serve --mode "${MODE}" \
+    >"${SERVER_LOG}" 2>&1 &
+  SERVER_PID="$!"
+  wait_for_server
+
+  warmup_json="$(make_payload "${PROMPT_SIZE}" forward false)"
+  measured_json="$(make_payload "${PROMPT_SIZE}" forward true "${TRACE_OUTPUT}")"
+
+  echo "Sending ${WARMUP_RUNS} forward warmup request(s)..."
+  for _ in $(seq 1 "${WARMUP_RUNS}"); do
+    curl -fsS "${CONTAINER_URL}/profile/forward" \
+      -H "Content-Type: application/json" \
+      -d "${warmup_json}" \
+      >/dev/null
+  done
+
+  echo "Sending measured forward request..."
+  curl -fsS "${CONTAINER_URL}/profile/forward" \
+    -H "Content-Type: application/json" \
+    -d "${measured_json}" \
+    | python3 -m json.tool
+
+  cleanup
+  trap - EXIT
+
+  echo
+  echo "CUDA forward profile complete:"
+  echo "  ${TRACE_OUTPUT}"
+  echo "  ${SERVER_LOG}"
+  echo
+  echo "Open the trace in chrome://tracing or Perfetto."
   exit 0
 fi
 
 install_nsys
 check_nsys_importer
 
+NSYS_OUTPUT="${TRACES_DIR}/${OUTPUT_STEM}"
 echo "Starting ${MODE} server under Nsight Systems for CUDA forward-pass profiling..."
 echo "Using prompt size: ${PROMPT_SIZE}; decode forwards: ${DECODE_STEPS}"
-echo "Writing profile to ${OUTPUT_BASENAME}.nsys-rep"
+echo "Warmup runs: ${WARMUP_RUNS}"
+echo "Writing profile to ${NSYS_OUTPUT}.nsys-rep"
 echo "Writing server log to ${SERVER_LOG}"
 
 INFERENCE_MODE="${MODE}" HOST="${HOST}" PORT="${PORT}" \
@@ -291,7 +398,7 @@ INFERENCE_MODE="${MODE}" HOST="${HOST}" PORT="${PORT}" \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
     --trace=cuda,nvtx,cublas,cudnn,osrt \
-    --output="${OUTPUT_BASENAME}" \
+    --output="${NSYS_OUTPUT}" \
     uv run --package qwen-inference qwen-serve --mode "${MODE}" \
     >"${SERVER_LOG}" 2>&1 &
 SERVER_PID="$!"
@@ -318,15 +425,15 @@ cleanup
 trap - EXIT
 
 echo
-if [[ -f "${OUTPUT_BASENAME}.nsys-rep" ]]; then
+if [[ -f "${NSYS_OUTPUT}.nsys-rep" ]]; then
   echo "CUDA forward profile complete:"
-  echo "  ${OUTPUT_BASENAME}.nsys-rep"
+  echo "  ${NSYS_OUTPUT}.nsys-rep"
   echo "  ${SERVER_LOG}"
   echo
   echo "Summarize with:"
-  echo "  nsys stats ${OUTPUT_BASENAME}.nsys-rep"
+  echo "  nsys stats ${NSYS_OUTPUT}.nsys-rep"
 else
-  echo "Nsight finished, but ${OUTPUT_BASENAME}.nsys-rep was not created." >&2
+  echo "Nsight finished, but ${NSYS_OUTPUT}.nsys-rep was not created." >&2
   echo "Check the server log:" >&2
   echo "  ${SERVER_LOG}" >&2
   exit 1

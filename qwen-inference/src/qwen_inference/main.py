@@ -11,8 +11,8 @@ import torch
 import uvicorn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from qwen_inference.loader import DEFAULT_MODEL_DIR, load_weights
-from qwen_inference.server import app, configure_baseline, configure_custom
+from qwen_inference.backends.custom.loader import DEFAULT_MODEL_DIR, load_weights
+from qwen_inference.server import app, configure_baseline, configure_custom, configure_vllm
 from qwen_inference.tokenizer import Tokenizer
 
 DEFAULT_HOST = os.environ.get("HOST", "0.0.0.0")
@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Qwen inference server.")
     parser.add_argument(
         "--mode",
-        choices=("baseline", "custom"),
+        choices=("baseline", "custom", "vllm"),
         default=DEFAULT_MODE,
         help='Serving backend to use. Can also be set with INFERENCE_MODE.',
     )
@@ -50,12 +50,27 @@ def _load_baseline_backend(model_dir: Path) -> None:
     configure_baseline(model, tokenizer, device=device)
 
 
+def _load_vllm_backend(model_dir: Path) -> None:
+    try:
+        import vllm  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            "vLLM is not installed. Install dependencies with "
+            "'UV_TORCH_BACKEND=auto uv sync --package qwen-inference --group dev --group vllm', "
+            "then rerun with --mode vllm."
+        ) from exc
+
+    configure_vllm(str(model_dir))
+
+
 def main() -> None:
     args = parse_args()
     model_dir = Path(DEFAULT_MODEL_DIR)
 
     if args.mode == "baseline":
         _load_baseline_backend(model_dir)
+    elif args.mode == "vllm":
+        _load_vllm_backend(model_dir)
     else:
         _load_custom_backend(model_dir)
 

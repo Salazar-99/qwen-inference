@@ -2,9 +2,9 @@
 name = "qwen-inference-scripts"
 version = "0.1.0"
 description = "Utility scripts for the qwen-inference project"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "huggingface-hub>=1.16.1",
+    "huggingface-hub>=0.34.0",
 ]
 
 [tool.uv]

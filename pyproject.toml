@@ -3,3 +3,8 @@ members = [
     "scripts",
     "qwen-inference",
 ]
+
+[tool.uv]
+override-dependencies = [
+    "huggingface-hub>=1.0.0",
+]

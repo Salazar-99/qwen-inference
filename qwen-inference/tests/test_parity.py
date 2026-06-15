@@ -7,7 +7,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from qwen_inference.loader import DEFAULT_MODEL_DIR, load_weights
+from qwen_inference.backends.custom.loader import DEFAULT_MODEL_DIR, load_weights
 
 
 def _hf_state_dict_from_loaded_weights(

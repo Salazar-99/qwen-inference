@@ -4,14 +4,23 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+from pathlib import Path
 import uuid
 from collections.abc import Iterator
-from typing import Any, Protocol
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
+
+from qwen_inference.backends import (
+    BaselineTransformersBackend,
+    CustomBackend,
+    InferenceBackend,
+    VllmBackend,
+)
+from qwen_inference.types import ChatMessage
 
 DEFAULT_MODEL = os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-4B")
 
@@ -23,11 +32,6 @@ class CompletionRequest(BaseModel):
     prompt: str
     max_tokens: int = 128
     temperature: float = 0.0
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
 
 
 class ChatCompletionRequest(BaseModel):
@@ -57,170 +61,7 @@ class ForwardProfileRequest(BaseModel):
     prompt: str
     decode_steps: int = 4
     profile: bool = True
-
-
-class InferenceBackend(Protocol):
-    def generate_from_prompt(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        temperature: float,
-    ) -> str: ...
-
-    def generate_from_messages(
-        self,
-        messages: list[ChatMessage],
-        *,
-        max_tokens: int,
-        temperature: float,
-        thinking: bool | None = None,
-        chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> str: ...
-
-    def profile_forward_passes(self, prompt: str, *, decode_steps: int) -> dict[str, Any]: ...
-
-
-class CustomBackend:
-    def __init__(self, weights: dict[str, Any], tokenizer: Any) -> None:
-        self.weights = weights
-        self.tokenizer = tokenizer
-
-    def generate_from_prompt(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        temperature: float,
-    ) -> str:
-        raise HTTPException(
-            status_code=501,
-            detail="Custom prompt completion is not implemented yet",
-        )
-
-    def generate_from_messages(
-        self,
-        messages: list[ChatMessage],
-        *,
-        max_tokens: int,
-        temperature: float,
-        thinking: bool | None = None,
-        chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> str:
-        raise HTTPException(
-            status_code=501,
-            detail="Custom chat completion is not implemented yet",
-        )
-
-    def profile_forward_passes(self, prompt: str, *, decode_steps: int) -> dict[str, Any]:
-        raise HTTPException(
-            status_code=501,
-            detail="Custom forward-pass profiling is not implemented yet",
-        )
-
-
-class BaselineTransformersBackend:
-    def __init__(
-        self,
-        model: PreTrainedModel,
-        tokenizer: PreTrainedTokenizerBase,
-        *,
-        device: str,
-    ) -> None:
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = torch.device(device)
-
-    def generate_from_prompt(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        temperature: float,
-    ) -> str:
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        return self._generate(inputs, max_tokens=max_tokens, temperature=temperature)
-
-    def generate_from_messages(
-        self,
-        messages: list[ChatMessage],
-        *,
-        max_tokens: int,
-        temperature: float,
-        thinking: bool | None = None,
-        chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> str:
-        template_kwargs = dict(chat_template_kwargs or {})
-        if thinking is not None:
-            template_kwargs["enable_thinking"] = thinking
-
-        input_ids = self.tokenizer.apply_chat_template(
-            [message.model_dump() for message in messages],
-            add_generation_prompt=True,
-            return_tensors="pt",
-            tokenize=True,
-            **template_kwargs,
-        ).to(self.device)
-        return self._generate(
-            {"input_ids": input_ids},
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
-    def _generate(
-        self,
-        inputs: dict[str, torch.Tensor],
-        *,
-        max_tokens: int,
-        temperature: float,
-    ) -> str:
-        input_length = inputs["input_ids"].shape[-1]
-        generation_kwargs: dict[str, Any] = {
-            **inputs,
-            "max_new_tokens": max_tokens,
-            "do_sample": temperature > 0,
-            "pad_token_id": self.tokenizer.eos_token_id,
-        }
-        if temperature > 0:
-            generation_kwargs["temperature"] = temperature
-
-        with torch.inference_mode():
-            output_ids = self.model.generate(**generation_kwargs)
-
-        new_tokens = output_ids[0, input_length:]
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-    def profile_forward_passes(self, prompt: str, *, decode_steps: int) -> dict[str, Any]:
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        input_length = inputs["input_ids"].shape[-1]
-        decode_steps = max(0, decode_steps)
-
-        with torch.inference_mode():
-            outputs = self.model(**inputs, use_cache=True)
-            past_key_values = outputs.past_key_values
-
-            attention_mask = inputs.get("attention_mask")
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            for _ in range(decode_steps):
-                if attention_mask is not None:
-                    attention_mask = torch.cat(
-                        [attention_mask, torch.ones_like(next_token)],
-                        dim=-1,
-                    )
-                outputs = self.model(
-                    input_ids=next_token,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                past_key_values = outputs.past_key_values
-                next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-
-        return {
-            "prompt_tokens": input_length,
-            "prefill_forwards": 1,
-            "decode_forwards": decode_steps,
-        }
+    trace_path: str | None = None
 
 
 def configure(weights: dict[str, Any], tokenizer: Any) -> None:
@@ -241,6 +82,11 @@ def configure_baseline(
 ) -> None:
     """Use Hugging Face Transformers directly for baseline profiling."""
     _set_backend(BaselineTransformersBackend(model, tokenizer, device=device))
+
+
+def configure_vllm(model_dir: str) -> None:
+    """Use vLLM for competition-style baseline serving."""
+    _set_backend(VllmBackend(model_dir))
 
 
 def _set_backend(backend: InferenceBackend) -> None:
@@ -289,6 +135,23 @@ def profile_forward_passes(prompt: str, *, decode_steps: int) -> dict[str, Any]:
     _ensure_model_ready()
     assert _backend is not None
     return _backend.profile_forward_passes(prompt, decode_steps=decode_steps)
+
+
+def profile_forward_passes_with_options(
+    prompt: str,
+    *,
+    decode_steps: int,
+    profile: bool = False,
+    trace_path: str | None = None,
+) -> dict[str, Any]:
+    _ensure_model_ready()
+    assert _backend is not None
+    return _backend.profile_forward_passes(
+        prompt,
+        decode_steps=decode_steps,
+        profile=profile,
+        trace_path=trace_path,
+    )
 
 
 def text_completion_response(text: str) -> dict[str, Any]:
@@ -345,6 +208,31 @@ def _nsys_capture(enabled: bool) -> Iterator[None]:
         torch.cuda.cudart().cudaProfilerStop()
 
 
+@contextmanager
+def _profile_capture(enabled: bool, trace_path: str | None = None) -> Iterator[None]:
+    if trace_path:
+        output_path = Path(trace_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        ) as profiler:
+            yield
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        profiler.export_chrome_trace(str(output_path))
+        return
+
+    with _nsys_capture(enabled):
+        yield
+
+
 app = FastAPI(title="Qwen Inference Server")
 
 
@@ -389,7 +277,17 @@ def invocations(request: InvocationRequest) -> dict[str, Any]:
 @app.post("/profile/forward")
 def profile_forward(request: ForwardProfileRequest) -> dict[str, Any]:
     _ensure_model_ready()
-    with _nsys_capture(request.profile):
+    assert _backend is not None
+
+    if isinstance(_backend, VllmBackend):
+        return profile_forward_passes_with_options(
+            request.prompt,
+            decode_steps=request.decode_steps,
+            profile=request.profile,
+            trace_path=request.trace_path,
+        )
+
+    with _profile_capture(request.profile, request.trace_path):
         return profile_forward_passes(
             request.prompt,
             decode_steps=request.decode_steps,

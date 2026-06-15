@@ -8,7 +8,7 @@ from safetensors.torch import load_file
 
 DEFAULT_MODEL_DIR = os.environ.get(
     "MODEL_DIR",
-    str(Path(__file__).resolve().parents[2] / "qwen-weights"),
+    str(Path(__file__).resolve().parents[4] / "qwen-weights"),
 )
 
 
