@@ -1,32 +1,39 @@
-"""Quantize Qwen3.5-4B to INT4 (GPTQ W4A16) with llm-compressor.
+"""Quantize Qwen3.5-4B with llm-compressor.
 
-This produces a `compressed-tensors` checkpoint that vLLM serves through the
-Marlin INT4 kernel on Ampere (A10G / sm_86), which is the highest-leverage win
-for the decode-bound short category (weights are the bottleneck, not compute).
+Two schemes are supported via --scheme:
 
-Run it in a DEDICATED, isolated environment -- NOT the uv workspace. The
-`llmcompressor` line that supports transformers 5.x (Qwen3.5) needs
-`compressed-tensors>=0.17.2a2`, which conflicts with the `compressed-tensors`
-version pinned by `vllm==0.19.1` in the server env. Quantization is a one-shot
-offline step and does not need `vllm`, so keep it separate:
+  W4A16 (default) — GPTQ weight-only INT4, 16-bit activations.
+    Served by vLLM through the Marlin INT4 kernel on Ampere (A10G / sm_86).
+    Best for decode-bound workloads (short category): cuts the bytes read per
+    weight by 4×, which is the bottleneck when batch=1 GEMVs re-read all
+    weights every token.
+
+  W8A8 — SmoothQuant INT8 weights + INT8 activations.
+    Served by vLLM through the INT8 tensor-core GEMM path on Ampere.
+    Best for prefill-heavy workloads (medium/long categories): activations are
+    also quantized so the matmuls run through INT8 tensor cores (~2× GEMM
+    throughput vs bf16). W8A8 also halves weight bandwidth vs bf16, so decode
+    still improves — just not as much as W4A16.
+
+Run in a DEDICATED, isolated environment -- NOT the uv workspace:
 
     uv venv .venv-quantize --python 3.12
-    UV_TORCH_BACKEND=auto uv pip install --python .venv-quantize \
+    UV_TORCH_BACKEND=auto uv pip install --python .venv-quantize \\
         -r scripts/quantize-requirements.txt
+
+    # W4A16 (default)
     .venv-quantize/bin/python scripts/quantize_gptq.py
 
-The isolated env still uses the git build of `transformers` (5.13.x dev), which
-is required to load the Qwen3.5 hybrid architecture for the calibration pass.
+    # W8A8
+    .venv-quantize/bin/python scripts/quantize_gptq.py --scheme W8A8
 
-By default it reads weights from `qwen-inference/qwen-weights` and writes the
-quantized checkpoint to `qwen-inference/qwen-weights-quantized`.
+Output directories:
+  W4A16 → qwen-inference/qwen-weights-w4a16
+  W8A8  → qwen-inference/qwen-weights-w8a8
 
 Notes:
-- W4A16 = 4-bit weights, 16-bit activations (weight-only). This is the right
-  scheme for Ampere, which has no FP8 tensor cores. It maximizes the decode
-  speedup; for prefill-heavy categories also evaluate INT8 W8A8.
 - `lm_head` is left unquantized by default (quality-sensitive vocab projection);
-  the gated-delta-net conv/recurrent kernels are not `nn.Linear` so they are
+  the gated-delta-net conv/recurrent kernels are not nn.Linear so they are
   untouched automatically.
 - Always validate against the competition quality gates (especially
   GPQA-Diamond) before submitting.
@@ -39,13 +46,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_DIR = REPO_ROOT / "qwen-inference" / "qwen-weights"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "qwen-inference" / "qwen-weights-quantized"
+DEFAULT_OUTPUT_DIRS = {
+    "W4A16": REPO_ROOT / "qwen-inference" / "qwen-weights-w4a16",
+    "W8A8": REPO_ROOT / "qwen-inference" / "qwen-weights-w8a8",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Path to the source (bf16) weights.")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Where to write the INT4 checkpoint.")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Where to write the quantized checkpoint (default: scheme-specific dir).")
+    parser.add_argument(
+        "--scheme",
+        choices=["W4A16", "W8A8"],
+        default="W4A16",
+        help="Quantization scheme. W4A16 uses GPTQ weight-only INT4 (best for decode). W8A8 uses SmoothQuant INT8 weights+activations (best for prefill). Default: W4A16.",
+    )
     parser.add_argument("--dataset", default="HuggingFaceH4/ultrachat_200k", help="HF calibration dataset.")
     parser.add_argument("--dataset-split", default="train_sft", help="Dataset split to sample from.")
     parser.add_argument("--num-samples", type=int, default=512, help="Number of calibration samples.")
@@ -61,7 +77,22 @@ def parse_args() -> argparse.Namespace:
             "calibration, so quantizing them would be meaningless or fail."
         ),
     )
+    parser.add_argument(
+        "--quantize-lm-head",
+        action="store_true",
+        default=False,
+        help=(
+            "Also quantize the lm_head (152k-vocab projection, 13.5%% of decode time). "
+            "Excluded by default: vLLM implements lm_head as VocabParallelEmbedding which "
+            "has no weight_scale slot, so the checkpoint fails to load. Only enable if "
+            "using a custom loader that supports quantized lm_head."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="Calibration sampling seed.")
+    # W8A8 / SmoothQuant knob — controls how aggressively outliers are migrated
+    # from activations to weights before INT8 quantization. 0.8 is the value
+    # recommended in the SmoothQuant paper for most transformer models.
+    parser.add_argument("--smoothing-strength", type=float, default=0.8, help="SmoothQuant migration strength α (W8A8 only). Default: 0.8.")
     return parser.parse_args()
 
 
@@ -93,11 +124,70 @@ def build_calibration_dataset(dataset: str, split: str, num_samples: int, seq_le
     return ds
 
 
+def build_recipe_w4a16(ignore: list[str]):
+    from llmcompressor.modifiers.quantization import GPTQModifier
+
+    return GPTQModifier(targets="Linear", scheme="W4A16", ignore=ignore)
+
+
+def build_recipe_w8a8(model, ignore: list[str], smoothing_strength: float):
+    from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+
+    # Qwen3_5ForConditionalGeneration is not in llm-compressor's architecture
+    # registry, so the default mapping resolution falls back to global regexes
+    # (re:.*input_layernorm) that match all 32 layers at once, causing:
+    #   "SmoothQuant must match a single smooth layer for each mapping"
+    # Fix: enumerate layers from the loaded model and generate one explicit
+    # (balance_layers, smooth_layer) pair per transformer block.
+    # Locate the transformer layer list via named_modules so the prefix exactly
+    # matches what llm-compressor sees (avoids hardcoding nesting depth).
+    # Qwen3.5 multimodal: model.model.language_model.layers → named path "model.language_model.layers"
+    import torch.nn as nn
+    layers = None
+    prefix_base = None
+    for mod_name, mod in model.named_modules():
+        if isinstance(mod, nn.ModuleList) and len(mod) > 1:
+            first = mod[0]
+            if hasattr(first, "self_attn") or hasattr(first, "mlp"):
+                layers = mod
+                prefix_base = mod_name  # e.g. "model.language_model.layers"
+                break
+    if layers is None:
+        raise RuntimeError("Could not find transformer layers ModuleList in model.")
+
+    mappings = []
+    for i, layer in enumerate(layers):
+        p = f"{prefix_base}.{i}"
+        # Full-attention layers have q/k/v_proj; GDN (linear-attn) layers do not.
+        if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "q_proj"):
+            mappings.append((
+                [f"{p}.self_attn.q_proj", f"{p}.self_attn.k_proj", f"{p}.self_attn.v_proj"],
+                f"{p}.input_layernorm",
+            ))
+        if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate_proj"):
+            mappings.append((
+                [f"{p}.mlp.gate_proj", f"{p}.mlp.up_proj"],
+                f"{p}.post_attention_layernorm",
+            ))
+
+    print(f"  SmoothQuant: generated {len(mappings)} explicit per-layer mappings.")
+    # SmoothQuant migrates activation outliers into weights before quantization,
+    # making both sides amenable to INT8 rounding. QuantizationModifier then
+    # applies RTN W8A8 (static-per-tensor weights, dynamic-per-token activations),
+    # which vLLM dispatches to INT8 cuBLAS / tensor-core GEMMs on Ampere.
+    return [
+        SmoothQuantModifier(smoothing_strength=smoothing_strength, mappings=mappings),
+        QuantizationModifier(targets="Linear", scheme="W8A8", ignore=ignore),
+    ]
+
+
 def main() -> None:
     args = parse_args()
 
     model_dir = args.model_dir.resolve()
-    output_dir = args.output_dir.resolve()
+    output_dir = (args.output_dir or DEFAULT_OUTPUT_DIRS[args.scheme]).resolve()
+
     if not model_dir.exists():
         raise SystemExit(
             f"Model weights not found at {model_dir}. "
@@ -110,7 +200,6 @@ def main() -> None:
         AutoTokenizer,
     )
     from llmcompressor import oneshot
-    from llmcompressor.modifiers.quantization import GPTQModifier
 
     print(f"Loading model from {model_dir} ...")
     load_kwargs = dict(dtype="auto", device_map="auto", trust_remote_code=True)
@@ -137,9 +226,18 @@ def main() -> None:
         tokenizer,
     )
 
-    recipe = GPTQModifier(targets="Linear", scheme="W4A16", ignore=list(args.ignore))
+    ignore = list(args.ignore)
+    if args.quantize_lm_head and "lm_head" in ignore:
+        ignore.remove("lm_head")
+        print("lm_head will be quantized (--quantize-lm-head set).")
 
-    print("Running GPTQ W4A16 quantization (this can take a while) ...")
+    if args.scheme == "W4A16":
+        recipe = build_recipe_w4a16(ignore)
+        print("Running GPTQ W4A16 quantization (this can take a while) ...")
+    else:
+        recipe = build_recipe_w8a8(model, ignore, args.smoothing_strength)
+        print(f"Running SmoothQuant W8A8 quantization (α={args.smoothing_strength}, this can take a while) ...")
+
     oneshot(
         model=model,
         dataset=calibration_ds,

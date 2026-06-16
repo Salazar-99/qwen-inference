@@ -62,7 +62,37 @@ def _warmup_prompt_token_counts() -> list[int]:
     return counts or list(WARMUP_PROMPT_TOKENS)
 
 
-def _build_async_engine(model_dir: str) -> Any:
+def _profiler_dir() -> Path:
+    profiler_dir = Path(os.environ.get("VLLM_PROFILER_DIR", "/tmp/vllm-profiler"))
+    profiler_dir.mkdir(parents=True, exist_ok=True)
+    return profiler_dir
+
+
+def _profiler_config(profiler_dir: Path) -> Any:
+    """Torch profiler settings for vLLM's worker-side CUDA traces.
+
+    vLLM reads these via ``ProfilerConfig`` on ``AsyncEngineArgs`` (not env vars).
+    ``record_shapes`` / ``profile_memory`` mirror the baseline backend's
+    ``torch.profiler.profile`` options so Chrome traces include per-op tensor dims.
+    """
+    from vllm.config import ProfilerConfig
+
+    return ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(profiler_dir),
+        torch_profiler_record_shapes=_env_flag(
+            "VLLM_TORCH_PROFILER_RECORD_SHAPES", default=True
+        ),
+        torch_profiler_with_memory=_env_flag(
+            "VLLM_TORCH_PROFILER_WITH_MEMORY", default=True
+        ),
+        # GPU kernels are profiled in the worker; skip AsyncLLM's CPU-only frontend
+        # profiler to avoid duplicate traces and extra overhead.
+        ignore_frontend=True,
+    )
+
+
+def _build_async_engine(model_dir: str, profiler_dir: Path) -> Any:
     """Construct the vLLM async engine (continuous batching across requests).
 
     This deployment runs the V1 engine (see ``vllm/v1/...`` in the profiler
@@ -81,12 +111,74 @@ def _build_async_engine(model_dir: str) -> Any:
             ),
         ) from exc
 
+    # Chunked prefill: disabled by default for single-request latency.
+    # When enabled (VLLM_CHUNKED_PREFILL=1) it triggers mixed prefill+decode
+    # batching which bypasses the Marlin INT4 GEMM path for prefill chunks,
+    # replacing it with cuBLAS bf16 GEMMs. Net effect on single-request short
+    # latency: neutral (1158ms vs 1167ms), profile wall time worse (+17%).
+    # May benefit multi-request throughput but hurts this competition's metric.
+    enable_chunked_prefill = _env_flag("VLLM_CHUNKED_PREFILL", default=False)
+
+    # Speculative decoding: off by default, opt-in via VLLM_SPEC_DECODE.
+    #
+    #   VLLM_SPEC_DECODE=ngram_gpu  — on-GPU n-gram lookup (no CPU sync).
+    #     Finds the trailing n-gram of the current context in the
+    #     prompt/output history and proposes the tokens that followed it.
+    #     VLLM_NUM_SPEC_TOKENS (default 5): draft tokens per step.
+    #     VLLM_SPEC_NGRAM_MIN/MAX (default 1/4): n-gram match window.
+    #
+    #   VLLM_SPEC_DECODE=mtp  — Qwen3.5 built-in MTP head.
+    #     Uses the mtp.* transformer layer shipped with the checkpoint to
+    #     predict 1 extra token in the same forward pass budget.
+    #     VLLM_NUM_SPEC_TOKENS (default 1): set to mtp_num_hidden_layers.
+    spec_decode_method = os.environ.get("VLLM_SPEC_DECODE", "").strip().lower()
+    spec_decode_config: dict | None = None
+    # ngram_gpu has a CUDA-graph sym_shape_indices bug at max_num_seqs=1 in
+    # vLLM 0.19.1; fall back to the stable CPU-numba ngram proposer.
+    if spec_decode_method == "ngram_gpu":
+        spec_decode_method = "ngram"
+    if spec_decode_method in ("ngram", "ngram_gpu"):
+        num_spec_tokens = int(os.environ.get("VLLM_NUM_SPEC_TOKENS", "5"))
+        ngram_min = int(os.environ.get("VLLM_SPEC_NGRAM_MIN", "1"))
+        ngram_max = int(os.environ.get("VLLM_SPEC_NGRAM_MAX", "4"))
+        spec_decode_config = {
+            "method": spec_decode_method,
+            "num_speculative_tokens": num_spec_tokens,
+            "prompt_lookup_min": ngram_min,
+            "prompt_lookup_max": ngram_max,
+        }
+    elif spec_decode_method == "mtp":
+        num_spec_tokens = int(os.environ.get("VLLM_NUM_SPEC_TOKENS", "1"))
+        spec_decode_config = {
+            "method": "qwen3_5_mtp",
+            "model": model_dir,
+            "num_speculative_tokens": num_spec_tokens,
+        }
+
     max_num_seqs = max(1, int(os.environ.get("VLLM_MAX_NUM_SEQS", "16")))
+    # Spec decode's dummy profiling pass allocates activations for
+    # max_num_seqs × (max_model_len + num_spec_tokens) tokens, which OOMs the
+    # vision tower's dummy forward on A10 (22 GB) at default max_num_seqs=16.
+    # The competition benchmark is single-request, so cap to 1.
+    if spec_decode_config and max_num_seqs > 1:
+        max_num_seqs = 1
+    # Default to 32768: covers 8192 prompt + 12288 GPQA output + buffer.
+    # vLLM's default of 262144 OOMs the vision tower dummy forward at startup.
+    max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "0")) or 32768
+
+    gpu_memory_utilization = float(
+        os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
+    )
     engine_args = AsyncEngineArgs(
         model=model_dir,
         dtype="bfloat16",
         trust_remote_code=True,
         max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
+        enable_chunked_prefill=enable_chunked_prefill,
+        speculative_config=spec_decode_config,
+        gpu_memory_utilization=gpu_memory_utilization,
+        profiler_config=_profiler_config(profiler_dir),
     )
 
     try:
@@ -189,13 +281,8 @@ class VllmBackend:
                 ),
             ) from exc
 
-        profiler_dir = Path(os.environ.get("VLLM_PROFILER_DIR", "/tmp/vllm-profiler"))
-        profiler_dir.mkdir(parents=True, exist_ok=True)
-        # The async/server torch profiler is enabled via env var; it must be set
-        # before the engine is constructed for start_profile()/stop_profile().
-        os.environ.setdefault("VLLM_TORCH_PROFILER_DIR", str(profiler_dir))
-
-        engine = _build_async_engine(model_dir)
+        profiler_dir = _profiler_dir()
+        engine = _build_async_engine(model_dir, profiler_dir)
         tokenizer = await _maybe_await(engine.get_tokenizer())
         backend = cls(engine, tokenizer, SamplingParams, profiler_dir)
 

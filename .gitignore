@@ -9,3 +9,4 @@ profiles/*
 !profiles/traces/
 profiles/traces/*
 !profiles/traces/**
+qwen-inference/qwen-weights*
