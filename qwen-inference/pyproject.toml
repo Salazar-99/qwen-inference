@@ -13,6 +13,9 @@ dependencies = [
 [project.scripts]
 qwen-serve = "qwen_inference.main:main"
 
+[project.entry-points."vllm.general_plugins"]
+qwen_custom_lm_head = "qwen_inference.vllm_plugin:register_custom_vllm_models"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

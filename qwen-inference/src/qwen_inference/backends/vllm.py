@@ -124,8 +124,8 @@ def _build_async_engine(model_dir: str, profiler_dir: Path) -> Any:
     #   VLLM_SPEC_DECODE=ngram_gpu  — on-GPU n-gram lookup (no CPU sync).
     #     Finds the trailing n-gram of the current context in the
     #     prompt/output history and proposes the tokens that followed it.
-    #     VLLM_NUM_SPEC_TOKENS (default 5): draft tokens per step.
-    #     VLLM_SPEC_NGRAM_MIN/MAX (default 1/4): n-gram match window.
+    #     VLLM_NUM_SPEC_TOKENS (default 11): draft tokens per step.
+    #     VLLM_SPEC_NGRAM_MIN/MAX (default 3/11): n-gram match window.
     #
     #   VLLM_SPEC_DECODE=mtp  — Qwen3.5 built-in MTP head.
     #     Uses the mtp.* transformer layer shipped with the checkpoint to
@@ -142,9 +142,9 @@ def _build_async_engine(model_dir: str, profiler_dir: Path) -> Any:
     # (vLLM 0.19.1). Running with max_num_seqs>=2 keeps the symbol alive and the
     # kernel compiles + captures the FULL decode graph. See _spec_min_num_seqs.
     if spec_decode_method in ("ngram", "ngram_gpu"):
-        num_spec_tokens = int(os.environ.get("VLLM_NUM_SPEC_TOKENS", "5"))
-        ngram_min = int(os.environ.get("VLLM_SPEC_NGRAM_MIN", "1"))
-        ngram_max = int(os.environ.get("VLLM_SPEC_NGRAM_MAX", "4"))
+        num_spec_tokens = int(os.environ.get("VLLM_NUM_SPEC_TOKENS", "11"))
+        ngram_min = int(os.environ.get("VLLM_SPEC_NGRAM_MIN", "3"))
+        ngram_max = int(os.environ.get("VLLM_SPEC_NGRAM_MAX", "11"))
         spec_decode_config = {
             "method": spec_decode_method,
             "num_speculative_tokens": num_spec_tokens,

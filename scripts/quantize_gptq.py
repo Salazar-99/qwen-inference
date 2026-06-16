@@ -50,6 +50,13 @@ DEFAULT_OUTPUT_DIRS = {
     "W4A16": REPO_ROOT / "qwen-inference" / "qwen-weights-w4a16",
     "W8A8": REPO_ROOT / "qwen-inference" / "qwen-weights-w8a8",
 }
+DEFAULT_OUTPUT_DIRS_LM_HEAD = {
+    "W4A16": REPO_ROOT / "qwen-inference" / "qwen-weights-w4a16-lmhead",
+    "W8A8": REPO_ROOT / "qwen-inference" / "qwen-weights-w8a8-lmhead",
+}
+CUSTOM_MODEL_FILENAME = "modeling_qwen3_custom.py"
+CUSTOM_MODEL_CLASS = "Qwen3_5ForConditionalGenerationCustom"
+CUSTOM_MODEL_TEMPLATE = Path(__file__).resolve().parent / CUSTOM_MODEL_FILENAME
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,11 +189,49 @@ def build_recipe_w8a8(model, ignore: list[str], smoothing_strength: float):
     ]
 
 
+def _patch_config_for_quantized_lm_head(config_path: Path) -> None:
+    """Update config.json for the custom vLLM lm_head loader."""
+    import json
+
+    with open(config_path) as config_file:
+        config = json.load(config_file)
+
+    config["architectures"] = [CUSTOM_MODEL_CLASS]
+    config["tie_word_embeddings"] = False
+    if "text_config" in config:
+        config["text_config"]["tie_word_embeddings"] = False
+
+    quant_cfg = config.get("quantization_config") or {}
+    ignore = quant_cfg.get("ignore") or []
+    quant_cfg["ignore"] = [entry for entry in ignore if entry != "lm_head"]
+    config["quantization_config"] = quant_cfg
+
+    with open(config_path, "w") as config_file:
+        json.dump(config, config_file, indent=2)
+        config_file.write("\n")
+
+
+def _install_custom_model_file(output_dir: Path) -> None:
+    import shutil
+
+    if not CUSTOM_MODEL_TEMPLATE.exists():
+        raise SystemExit(f"Missing custom model template: {CUSTOM_MODEL_TEMPLATE}")
+
+    dst = output_dir / CUSTOM_MODEL_FILENAME
+    shutil.copy2(CUSTOM_MODEL_TEMPLATE, dst)
+    print(f"  installed custom vLLM model: {dst.name}")
+
+
 def main() -> None:
     args = parse_args()
 
     model_dir = args.model_dir.resolve()
-    output_dir = (args.output_dir or DEFAULT_OUTPUT_DIRS[args.scheme]).resolve()
+    if args.output_dir is not None:
+        output_dir = args.output_dir.resolve()
+    elif args.quantize_lm_head:
+        output_dir = DEFAULT_OUTPUT_DIRS_LM_HEAD[args.scheme].resolve()
+    else:
+        output_dir = DEFAULT_OUTPUT_DIRS[args.scheme].resolve()
 
     if not model_dir.exists():
         raise SystemExit(
@@ -269,6 +314,15 @@ def main() -> None:
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
             print(f"  copied aux file: {name}")
+
+    if args.quantize_lm_head:
+        _patch_config_for_quantized_lm_head(output_dir / "config.json")
+        _install_custom_model_file(output_dir)
+        print(
+            f"Patched config for {CUSTOM_MODEL_CLASS} "
+            "(tie_word_embeddings=false, lm_head removed from ignore)."
+        )
+
     print("Done. Serve with vLLM by pointing the model path at:")
     print(f"  {output_dir}")
 

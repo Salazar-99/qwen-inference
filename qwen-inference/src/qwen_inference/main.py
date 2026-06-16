@@ -57,6 +57,8 @@ def _load_baseline_backend(model_dir: Path) -> None:
 
 
 def _load_vllm_backend(model_dir: Path) -> None:
+    os.environ.setdefault("MODEL_DIR", str(model_dir))
+
     try:
         import vllm  # noqa: F401
     except ImportError as exc:
