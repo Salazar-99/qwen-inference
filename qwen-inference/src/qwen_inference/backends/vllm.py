@@ -133,10 +133,14 @@ def _build_async_engine(model_dir: str, profiler_dir: Path) -> Any:
     #     VLLM_NUM_SPEC_TOKENS (default 1): set to mtp_num_hidden_layers.
     spec_decode_method = os.environ.get("VLLM_SPEC_DECODE", "").strip().lower()
     spec_decode_config: dict | None = None
-    # ngram_gpu has a CUDA-graph sym_shape_indices bug at max_num_seqs=1 in
-    # vLLM 0.19.1; fall back to the stable CPU-numba ngram proposer.
-    if spec_decode_method == "ngram_gpu":
-        spec_decode_method = "ngram"
+    # ngram_gpu (on-GPU n-gram lookup, no CPU sync) needs the compiled batch dim
+    # to stay dynamic. Its NgramGPUKernel is @support_torch_compile-decorated and
+    # marks dim 0 (batch) dynamic via torch._dynamo.mark_dynamic, but dynamo
+    # auto-specializes size-0/1 dims to constants. At max_num_seqs=1 the batch
+    # dim collapses, so no SymInt reaches the piecewise backend and
+    # sym_shape_indices is empty -> IndexError during CUDA-graph dispatch
+    # (vLLM 0.19.1). Running with max_num_seqs>=2 keeps the symbol alive and the
+    # kernel compiles + captures the FULL decode graph. See _spec_min_num_seqs.
     if spec_decode_method in ("ngram", "ngram_gpu"):
         num_spec_tokens = int(os.environ.get("VLLM_NUM_SPEC_TOKENS", "5"))
         ngram_min = int(os.environ.get("VLLM_SPEC_NGRAM_MIN", "1"))
@@ -159,9 +163,13 @@ def _build_async_engine(model_dir: str, profiler_dir: Path) -> Any:
     # Spec decode's dummy profiling pass allocates activations for
     # max_num_seqs × (max_model_len + num_spec_tokens) tokens, which OOMs the
     # vision tower's dummy forward on A10 (22 GB) at default max_num_seqs=16.
-    # The competition benchmark is single-request, so cap to 1.
-    if spec_decode_config and max_num_seqs > 1:
-        max_num_seqs = 1
+    # The competition benchmark is single-request, so cap spec decode to the
+    # minimum it can run at. ngram_gpu needs >=2 to keep its compiled batch dim
+    # dynamic (see above); everything else runs at 1.
+    if spec_decode_config:
+        spec_min_num_seqs = 2 if spec_decode_method == "ngram_gpu" else 1
+        if max_num_seqs > spec_min_num_seqs:
+            max_num_seqs = spec_min_num_seqs
     # Default to 32768: covers 8192 prompt + 12288 GPQA output + buffer.
     # vLLM's default of 262144 OOMs the vision tower dummy forward at startup.
     max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "0")) or 32768

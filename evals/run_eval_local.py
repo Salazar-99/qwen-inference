@@ -210,6 +210,12 @@ def run_quality_eval():
                 def do_POST(self):
                     try:
                         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                        try:
+                            parsed = json.loads(body)
+                            parsed["chat_template_kwargs"] = {"enable_thinking": False}
+                            body = json.dumps(parsed).encode()
+                        except Exception:
+                            pass
                         req = urllib.request.Request(f"{CONTAINER_URL}/invocations",
                             data=body, headers={"Content-Type": "application/json"})
                         resp = urllib.request.urlopen(req, timeout=120)
