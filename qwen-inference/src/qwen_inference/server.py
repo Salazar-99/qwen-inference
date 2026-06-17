@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager, contextmanager
+import json
 import os
 from pathlib import Path
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, AsyncGenerator, Awaitable, Callable, Iterator
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -168,6 +170,59 @@ def text_completion_response(text: str) -> dict[str, Any]:
     return {"choices": [{"text": text}]}
 
 
+def _chat_chunk(
+    chunk_id: str,
+    model: str,
+    *,
+    delta: dict[str, Any],
+    finish_reason: str | None,
+) -> dict[str, Any]:
+    return {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+async def _stream_chat_response(
+    request: "ChatCompletionRequest",
+) -> AsyncGenerator[str, None]:
+    """Yield SSE-formatted chunks for a streaming chat completion."""
+    _ensure_model_ready()
+    assert _backend is not None
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+    model_name = request.model or DEFAULT_MODEL
+    thinking = _thinking_enabled(request.thinking, request.chat_template_kwargs)
+
+    # Role announcement chunk
+    yield f"data: {json.dumps(_chat_chunk(chunk_id, model_name, delta={'role': 'assistant', 'content': ''}, finish_reason=None))}\n\n"
+
+    if hasattr(_backend, "generate_stream_from_messages"):
+        async for delta in _backend.generate_stream_from_messages(
+            request.messages,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            thinking=thinking,
+            chat_template_kwargs=request.chat_template_kwargs,
+        ):
+            yield f"data: {json.dumps(_chat_chunk(chunk_id, model_name, delta={'content': delta}, finish_reason=None))}\n\n"
+    else:
+        # Fallback for non-streaming backends: collect then emit as one chunk
+        text = await generate_from_messages(
+            request.messages,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            thinking=thinking,
+            chat_template_kwargs=request.chat_template_kwargs,
+        )
+        yield f"data: {json.dumps(_chat_chunk(chunk_id, model_name, delta={'content': text}, finish_reason=None))}\n\n"
+
+    yield f"data: {json.dumps(_chat_chunk(chunk_id, model_name, delta={}, finish_reason='stop'))}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 def chat_completion_response(text: str, *, model: str) -> dict[str, Any]:
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -269,7 +324,19 @@ async def invocations(request: InvocationRequest) -> dict[str, Any]:
 
     if request.messages is not None:
         if request.stream:
-            raise HTTPException(status_code=501, detail="Streaming is not implemented yet")
+            chat_req = ChatCompletionRequest(
+                model=DEFAULT_MODEL,
+                messages=request.messages,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                thinking=request.thinking,
+                stream=True,
+                chat_template_kwargs=request.chat_template_kwargs,
+            )
+            return StreamingResponse(
+                _stream_chat_response(chat_req),
+                media_type="text/event-stream",
+            )
         with _nsys_capture(request.profile):
             text = await generate_from_messages(
                 request.messages,
@@ -327,11 +394,14 @@ async def v1_completions(request: CompletionRequest) -> dict[str, Any]:
 
 
 @app.post("/v1/chat/completions")
-async def v1_chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
+async def v1_chat_completions(request: ChatCompletionRequest) -> Any:
     _ensure_model_ready()
 
     if request.stream:
-        raise HTTPException(status_code=501, detail="Streaming is not implemented yet")
+        return StreamingResponse(
+            _stream_chat_response(request),
+            media_type="text/event-stream",
+        )
 
     text = await generate_from_messages(
         request.messages,

@@ -11,7 +11,7 @@ from pathlib import Path
 import shutil
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import torch
@@ -159,17 +159,12 @@ def _build_async_engine(model_dir: str, profiler_dir: Path) -> Any:
             "num_speculative_tokens": num_spec_tokens,
         }
 
-    max_num_seqs = max(1, int(os.environ.get("VLLM_MAX_NUM_SEQS", "16")))
-    # Spec decode's dummy profiling pass allocates activations for
-    # max_num_seqs × (max_model_len + num_spec_tokens) tokens, which OOMs the
-    # vision tower's dummy forward on A10 (22 GB) at default max_num_seqs=16.
-    # The competition benchmark is single-request, so cap spec decode to the
-    # minimum it can run at. ngram_gpu needs >=2 to keep its compiled batch dim
-    # dynamic (see above); everything else runs at 1.
-    if spec_decode_config:
-        spec_min_num_seqs = 2 if spec_decode_method == "ngram_gpu" else 1
-        if max_num_seqs > spec_min_num_seqs:
-            max_num_seqs = spec_min_num_seqs
+    # Default to 4 when spec decode is active: allows the quality eval's 8
+    # concurrent workers to share the engine in one batch, while staying within
+    # the 22 GB A10G budget during vLLM's dummy-profiling pass.
+    # max_num_seqs=16 OOMs with spec decode + 32k context; 8 is verified safe.
+    _spec_default = "8" if spec_decode_config else "16"
+    max_num_seqs = max(1, int(os.environ.get("VLLM_MAX_NUM_SEQS", _spec_default)))
     # Default to 32768: covers 8192 prompt + 12288 GPQA output + buffer.
     # vLLM's default of 262144 OOMs the vision tower dummy forward at startup.
     max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "0")) or 32768
@@ -405,6 +400,36 @@ class VllmBackend:
         )
         params = self._sampling_params(max_tokens=max_tokens, temperature=temperature)
         return await self._agenerate(prompt, params)
+
+    async def generate_stream_from_messages(
+        self,
+        messages: list[ChatMessage],
+        *,
+        max_tokens: int,
+        temperature: float,
+        thinking: bool | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> "AsyncIterator[str]":
+        template_kwargs = dict(chat_template_kwargs or {})
+        if thinking is not None:
+            template_kwargs["enable_thinking"] = thinking
+
+        prompt = self.tokenizer.apply_chat_template(
+            [message.model_dump() for message in messages],
+            add_generation_prompt=True,
+            tokenize=False,
+            **template_kwargs,
+        )
+        params = self._sampling_params(max_tokens=max_tokens, temperature=temperature)
+        request_id = f"qwen-{uuid.uuid4().hex}"
+        prev_len = 0
+        async for output in self._engine.generate(prompt, params, request_id):
+            if output.outputs:
+                text = output.outputs[0].text
+                delta = text[prev_len:]
+                prev_len = len(text)
+                if delta:
+                    yield delta
 
     async def profile_forward_passes(
         self,

@@ -26,7 +26,10 @@ ENV VLLM_SPEC_DECODE=ngram
 ENV VLLM_NUM_SPEC_TOKENS=11
 ENV VLLM_SPEC_NGRAM_MIN=3
 ENV VLLM_SPEC_NGRAM_MAX=11
-ENV VLLM_MAX_NUM_SEQS=1
+# max_num_seqs=8 with spec decode: matches NUM_CONCURRENT=8 in the quality eval
+# so all requests fit in one batch. max_num_seqs=16 OOMs with spec decode +
+# 32k context on A10G; 8 is verified safe (7.21 GiB KV cache available).
+ENV VLLM_MAX_NUM_SEQS=8
 
 # 32768 covers 8192 prompt + 12288 GPQA output + buffer (quality eval).
 # Latency bench used 8448; use 32768 for full eval submission.

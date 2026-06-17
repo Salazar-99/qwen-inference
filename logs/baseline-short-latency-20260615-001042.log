@@ -1,0 +1,21 @@
+/home/ubuntu/qwen-inference/.venv/lib/python3.13/site-packages/torch/cuda/__init__.py:182: UserWarning: CUDA initialization: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 304: OS call failed or operation not supported on this OS (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:119.)
+  return torch._C._cuda_getDeviceCount() > 0
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+[ERROR] `loss` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/ubuntu/qwen-inference/.venv/lib/python3.13/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+[ERROR] `logits` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/ubuntu/qwen-inference/.venv/lib/python3.13/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+Loading weights:   0%|          | 0/426 [00:00<?, ?it/s]Loading weights:  18%|█▊        | 75/426 [00:00<00:00, 730.09it/s]Loading weights:  35%|███▍      | 149/426 [00:00<00:00, 643.84it/s]Loading weights:  50%|█████     | 215/426 [00:00<00:00, 639.13it/s]Loading weights:  67%|██████▋   | 287/426 [00:00<00:00, 649.27it/s]Loading weights:  83%|████████▎ | 355/426 [00:00<00:00, 646.05it/s]Loading weights:  99%|█████████▊| 420/426 [00:00<00:00, 633.59it/s]Loading weights: 100%|██████████| 426/426 [00:00<00:00, 649.97it/s]
+INFO:     Started server process [85468]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58110 - "GET /ping HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58118 - "POST /invocations HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33306 - "POST /invocations HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48860 - "POST /invocations HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54402 - "POST /invocations HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39494 - "POST /invocations HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35140 - "POST /invocations HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [85468]
